@@ -1,140 +1,128 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
 #[ink::contract]
-mod ink_token_balance {
+mod token_contract {
+    use ink::storage::Mapping;
 
-    /// Defines the storage of your contract.
-    /// Add new fields to the below struct in order
-    /// to add new static storage fields to your contract.
     #[ink(storage)]
-    pub struct InkTokenBalance {
-        /// Stores a single `bool` value on the storage.
-        value: bool,
+    pub struct TokenContract {
+        /// The owner (admin) allowed to mint new tokens.
+        owner: AccountId,
+        /// Mapping from account to token balance.
+        balances: Mapping<AccountId, u128>,
+        /// Total supply of all minted tokens.
+        total_supply: u128,
     }
 
-    impl InkTokenBalance {
-        /// Constructor that initializes the `bool` value to the given `init_value`.
+    #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum Error {
+        /// Caller attempted an owner-only action.
+        NotOwner,
+        /// Sender tried to transfer more than their balance.
+        InsufficientBalance,
+        /// Arithmetic overflow/underflow detected.
+        ArithmeticError,
+        /// Provided amount must be greater than zero.
+        ZeroAmount,
+    }
+
+    pub type Result<T> = core::result::Result<T, Error>;
+
+    /// Emitted when tokens are minted to an account.
+    #[ink(event)]
+    pub struct Minted {
+        #[ink(topic)]
+        to: AccountId,
+        amount: u128,
+    }
+
+    /// Emitted when tokens are transferred between accounts.
+    #[ink(event)]
+    pub struct Transferred {
+        #[ink(topic)]
+        from: AccountId,
+        #[ink(topic)]
+        to: AccountId,
+        amount: u128,
+    }
+
+    impl Default for TokenContract {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl TokenContract {
+        /// Initializes the token contract setting the deployer as the owner.
         #[ink(constructor)]
-        pub fn new(init_value: bool) -> Self {
-            Self { value: init_value }
+        pub fn new() -> Self {
+            Self {
+                owner: Self::env().caller(),
+                balances: Mapping::default(),
+                total_supply: 0,
+            }
         }
 
-        /// Constructor that initializes the `bool` value to `false`.
-        ///
-        /// Constructors can delegate to other constructors.
-        #[ink(constructor)]
-        pub fn default() -> Self {
-            Self::new(Default::default())
-        }
-
-        /// A message that can be called on instantiated contracts.
-        /// This one flips the value of the stored `bool` from `true`
-        /// to `false` and vice versa.
+        /// Returns the token balance of the given account.
         #[ink(message)]
-        pub fn flip(&mut self) {
-            self.value = !self.value;
+        pub fn balance_of(&self, owner: AccountId) -> u128 {
+            self.balances.get(owner).unwrap_or(0)
         }
 
-        /// Simply returns the current value of our `bool`.
+        /// Returns the total supply of minted tokens.
         #[ink(message)]
-        pub fn get(&self) -> bool {
-            self.value
-        }
-    }
-
-    /// Unit tests in Rust are normally defined within such a `#[cfg(test)]`
-    /// module and test functions are marked with a `#[test]` attribute.
-    /// The below code is technically just normal Rust code.
-    #[cfg(test)]
-    mod tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
-        use super::*;
-
-        /// We test if the default constructor does its job.
-        #[ink::test]
-        fn default_works() {
-            let ink_token_balance = InkTokenBalance::default();
-            assert_eq!(ink_token_balance.get(), false);
+        pub fn total_supply(&self) -> u128 {
+            self.total_supply
         }
 
-        /// We test a simple use case of our contract.
-        #[ink::test]
-        fn it_works() {
-            let mut ink_token_balance = InkTokenBalance::new(false);
-            assert_eq!(ink_token_balance.get(), false);
-            ink_token_balance.flip();
-            assert_eq!(ink_token_balance.get(), true);
-        }
-    }
+        /// Mints `amount` tokens to `to`. Only the contract owner may call this.
+        #[ink(message)]
+        pub fn mint(&mut self, to: AccountId, amount: u128) -> Result<()> {
+            if Self::env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            if amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
 
+            let current = self.balances.get(to).unwrap_or(0);
+            let new_balance = current.checked_add(amount).ok_or(Error::ArithmeticError)?;
+            self.balances.insert(to, &new_balance);
 
-    /// This is how you'd write end-to-end (E2E) or integration tests for ink! contracts.
-    ///
-    /// When running these you need to make sure that you:
-    /// - Compile the tests with the `e2e-tests` feature flag enabled (`--features e2e-tests`)
-    /// - Are running a Substrate node which contains `pallet-contracts` in the background
-    #[cfg(all(test, feature = "e2e-tests"))]
-    mod e2e_tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
-        use super::*;
+            // Increase total supply safely
+            self.total_supply = self
+                .total_supply
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticError)?;
 
-        /// A helper function used for calling contract messages.
-        use ink_e2e::ContractsBackend;
-
-        /// The End-to-End test `Result` type.
-        type E2EResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-        /// We test that we can upload and instantiate the contract using its default constructor.
-        #[ink_e2e::test]
-        async fn default_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let mut constructor = InkTokenBalanceRef::default();
-
-            // When
-            let contract = client
-                .instantiate("ink_token_balance", &ink_e2e::alice(), &mut constructor)
-                .submit()
-                .await
-                .expect("instantiate failed");
-            let call_builder = contract.call_builder::<InkTokenBalance>();
-
-            // Then
-            let get = call_builder.get();
-            let get_result = client.call(&ink_e2e::alice(), &get).dry_run().await?;
-            assert!(matches!(get_result.return_value(), false));
-
+            self.env().emit_event(Minted { to, amount });
             Ok(())
         }
 
-        /// We test that we can read and write a value from the on-chain contract.
-        #[ink_e2e::test]
-        async fn it_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let mut constructor = InkTokenBalanceRef::new(false);
-            let contract = client
-                .instantiate("ink_token_balance", &ink_e2e::bob(), &mut constructor)
-                .submit()
-                .await
-                .expect("instantiate failed");
-            let mut call_builder = contract.call_builder::<InkTokenBalance>();
+        /// Transfers `amount` tokens from the caller to `to`.
+        #[ink(message)]
+        pub fn transfer(&mut self, to: AccountId, amount: u128) -> Result<()> {
+            if amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
 
-            let get = call_builder.get();
-            let get_result = client.call(&ink_e2e::bob(), &get).dry_run().await?;
-            assert!(matches!(get_result.return_value(), false));
+            let from = self.env().caller();
+            let from_balance = self.balances.get(from).unwrap_or(0);
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
 
-            // When
-            let flip = call_builder.flip();
-            let _flip_result = client
-                .call(&ink_e2e::bob(), &flip)
-                .submit()
-                .await
-                .expect("flip failed");
+            let new_from = from_balance
+                .checked_sub(amount)
+                .ok_or(Error::ArithmeticError)?;
+            let to_balance = self.balances.get(to).unwrap_or(0);
+            let new_to = to_balance.checked_add(amount).ok_or(Error::ArithmeticError)?;
 
-            // Then
-            let get = call_builder.get();
-            let get_result = client.call(&ink_e2e::bob(), &get).dry_run().await?;
-            assert!(matches!(get_result.return_value(), true));
+            self.balances.insert(from, &new_from);
+            self.balances.insert(to, &new_to);
 
+            self.env().emit_event(Transferred { from, to, amount });
             Ok(())
         }
     }
